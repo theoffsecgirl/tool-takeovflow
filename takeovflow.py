@@ -1,517 +1,629 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+takeovflow – Advanced Subdomain Takeover Scanner
 
-import os
-import sys
-import re
+Versión mejorada con:
+- Comprobación de herramientas externas
+- Modos pasivo / activo
+- Salida JSON opcional
+- Soporte para templates personalizados de nuclei
+- Detección básica de patrones de CNAME típicos de takeover
+"""
+
+import argparse
 import subprocess
-import threading
-import queue
-import tempfile
-import datetime
-import time
-import json
 import shutil
-import signal
-
-USER_AGENT = "SubdomainScannerPro (by TheOffSecGirl)"
-LOG_FORMAT = "[{time}] [{level}] {msg}"
-LOG_LOCK = threading.Lock()
-VERBOSE = False
-THREADS = 50
-TIMEOUT = 45
-RATE_LIMIT = 2
-
-domain_rx = re.compile(r'^([a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}$')
-
-eligible_domains = []
-tmp_dir = None
-log_file = None
+import sys
+import tempfile
+import os
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 
-def log(level, msg):
-    """Registra mensajes en consola y archivo de log"""
-    global log_file
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = LOG_FORMAT.format(time=now, level=level, msg=msg)
-    with LOG_LOCK:
-        if VERBOSE or level in ["ERROR", "WARN", "INFO"]:
-            print(line)
-        if log_file:
-            log_file.write(line + "\n")
-            log_file.flush()
+REQUIRED_TOOLS = [
+    "subfinder",
+    "assetfinder",
+    "subjack",
+    "dnsx",
+    "httpx",
+    "nuclei",
+    "dig",
+    "jq",
+    "curl",
+]
+
+CNAME_TAKEOVER_PATTERNS = [
+    "amazonaws.com",
+    "cloudfront.net",
+    "herokudns.com",
+    "github.io",
+    "githubusercontent.com",
+    "azurewebsites.net",
+    "trafficmanager.net",
+    "fastly.net",
+    "edgesuite.net",
+    "akamai.net",
+    "unbouncepages.com",
+    "wordpress.com",
+    "zendesk.com",
+]
 
 
-def parse_args():
-    """Parsea argumentos de línea de comandos"""
-    import argparse
-    global VERBOSE, THREADS, RATE_LIMIT, eligible_domains
+def print_banner():
+    print("=" * 60)
+    print(" takeovflow – Subdomain Takeover Scanner")
+    print(" by TheOffSecGirl")
+    print("=" * 60)
+    print()
 
+
+def run_cmd(cmd: List[str], verbose: bool = False) -> str:
+    if verbose:
+        print(f"[cmd] {' '.join(cmd)}")
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        return out.decode(errors="ignore")
+    except subprocess.CalledProcessError:
+        return ""
+    except FileNotFoundError:
+        return ""
+
+
+def check_tool(tool: str) -> bool:
+    return shutil.which(tool) is not None
+
+
+def ensure_tools(verbose: bool = False):
+    missing = [t for t in REQUIRED_TOOLS if not check_tool(t)]
+    if missing:
+        print("[!] Faltan herramientas necesarias:")
+        for m in missing:
+            print(f"   - {m}")
+        print("\nInstálalas antes de ejecutar este script.")
+        sys.exit(1)
+    if verbose:
+        print("[+] Todas las herramientas externas requeridas están disponibles.\n")
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Subdomain Takeover Scanner Pro",
-        usage="python3 script.py [opciones]\nEjemplo: python3 script.py -d example.com -t 100 -r 5 -v"
+        description="takeovflow – Advanced Subdomain Takeover Scanner"
     )
-    parser.add_argument("-d", "--domain", help="Escanear un único dominio")
-    parser.add_argument("-f", "--file", help="Archivo con lista de dominios (uno por línea)")
-    parser.add_argument("-l", "--list", help="Lista de dominios separados por comas")
-    parser.add_argument("-t", "--threads", type=int, default=50, help="Número de hilos a usar (default: 50)")
-    parser.add_argument("-r", "--rate", type=int, default=2, help="Rate limit (default: 2)")
-    parser.add_argument("-v", "--verbose", action='store_true', help="Modo verbose (detallado)")
+    parser.add_argument("-d", "--domain", help="Dominio único a analizar")
+    parser.add_argument("-f", "--file", help="Archivo con dominios (uno por línea)")
+    parser.add_argument("-l", "--list", help="Lista de dominios separada por comas")
+    parser.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        default=50,
+        help="Número de hilos para herramientas externas (por defecto 50)",
+    )
+    parser.add_argument(
+        "-r",
+        "--rate",
+        type=int,
+        default=2,
+        help="Rate limit aproximado para algunas herramientas (por defecto 2)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Modo verbose",
+    )
+    parser.add_argument(
+        "--passive-only",
+        action="store_true",
+        help="Solo técnicas pasivas (no escaneos activos)",
+    )
+    parser.add_argument(
+        "--active-only",
+        action="store_true",
+        help="Solo fase activa (asume subdominios ya descubiertos)",
+    )
+    parser.add_argument(
+        "--json-output",
+        action="store_true",
+        help="Generar también informe en JSON",
+    )
+    parser.add_argument(
+        "--nuclei-templates",
+        help="Ruta a templates personalizados de nuclei",
+    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
-    VERBOSE = args.verbose
-    
-    if args.threads < 1:
-        log("ERROR", "Threads debe ser un número entero positivo")
-        sys.exit(1)
-    if args.rate < 1:
-        log("ERROR", "Rate limit debe ser un número entero positivo")
-        sys.exit(1)
-    
-    THREADS = args.threads
-    RATE_LIMIT = args.rate
 
-    domains_input = []
+def load_domains_from_file(path: str) -> List[str]:
+    domains: List[str] = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            d = line.strip()
+            if d and not d.startswith("#"):
+                domains.append(d)
+    return domains
+
+
+def normalize_domains(args: argparse.Namespace) -> List[str]:
+    domains: List[str] = []
 
     if args.domain:
-        domain = clean_domain(args.domain)
-        if not validate_domain(domain):
-            log("ERROR", f"Dominio inválido: {args.domain}")
-            sys.exit(1)
-        domains_input.append(domain)
-    
-    if args.file:
-        try:
-            with open(args.file, "r", encoding="utf-8") as f:
-                for line in f:
-                    domain = clean_domain(line)
-                    if validate_domain(domain):
-                        domains_input.append(domain)
-        except Exception as e:
-            log("ERROR", f"No se pudo leer archivo de dominios: {e}")
-            sys.exit(1)
-    
-    if args.list:
-        for item in args.list.split(","):
-            domain = clean_domain(item)
-            if validate_domain(domain):
-                domains_input.append(domain)
+        domains.append(args.domain.strip())
 
-    if not domains_input:
-        log("ERROR", "No se especificaron dominios válidos para escanear")
-        parser.print_help()
+    if args.file:
+        domains.extend(load_domains_from_file(args.file))
+
+    if args.list:
+        parts = [p.strip() for p in args.list.split(",")]
+        domains.extend([p for p in parts if p])
+
+    # dedupe y limpia
+    clean: List[str] = []
+    for d in domains:
+        d = d.lower()
+        if d.startswith("http://"):
+            d = d[len("http://") :]
+        if d.startswith("https://"):
+            d = d[len("https://") :]
+        d = d.strip("/")
+        if d and d not in clean:
+            clean.append(d)
+
+    if not clean:
+        print("[!] No se han proporcionado dominios válidos.")
         sys.exit(1)
 
-    # Eliminar duplicados y ordenar
-    eligible_domains = sorted(set(domains_input))
+    return clean
 
 
-def clean_domain(domain):
-    """Limpia y normaliza el dominio"""
-    d = domain.strip()
-    d = re.sub(r'^https?://', '', d)
-    d = d.rstrip('/')
-    return d
+def discover_subdomains(domain: str, tmpdir: Path, threads: int, verbose: bool) -> Path:
+    subfinder_out = tmpdir / f"{domain}_subfinder.txt"
+    assetfinder_out = tmpdir / f"{domain}_assetfinder.txt"
+    combined_out = tmpdir / f"{domain}_subdomains_all.txt"
+
+    # subfinder
+    cmd_subfinder = [
+        "subfinder",
+        "-d",
+        domain,
+        "-silent",
+        "-o",
+        str(subfinder_out),
+    ]
+    run_cmd(cmd_subfinder, verbose=verbose)
+
+    # assetfinder
+    cmd_assetfinder = [
+        "assetfinder",
+        "--subs-only",
+        domain,
+    ]
+    out_asset = run_cmd(cmd_assetfinder, verbose=verbose)
+    if out_asset:
+        assetfinder_out.write_text(out_asset, encoding="utf-8")
+
+    # combinar y deduplicar
+    subs: List[str] = []
+    for p in [subfinder_out, assetfinder_out]:
+        if p.exists():
+            with p.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if s and s not in subs:
+                        subs.append(s)
+    subs.sort()
+    combined_out.write_text("\n".join(subs), encoding="utf-8")
+
+    if verbose:
+        print(f"[+] {domain}: {len(subs)} subdominios descubiertos (pasivo)")
+
+    return combined_out
 
 
-def validate_domain(domain):
-    """Valida el formato del dominio"""
-    return bool(domain_rx.match(domain))
+def resolve_subdomains(
+    domain: str, subs_file: Path, tmpdir: Path, threads: int, verbose: bool
+) -> Dict[str, Any]:
+    """Usa dnsx + httpx para obtener subdominios vivos y algunos metadatos básicos."""
+    results: Dict[str, Any] = {
+        "resolved": [],
+        "httpx": [],
+    }
+
+    if not subs_file.exists():
+        return results
+
+    # dnsx
+    dnsx_out = tmpdir / f"{domain}_dnsx.txt"
+    cmd_dnsx = [
+        "dnsx",
+        "-silent",
+        "-resp",
+        "-l",
+        str(subs_file),
+        "-o",
+        str(dnsx_out),
+    ]
+    run_cmd(cmd_dnsx, verbose=verbose)
+
+    resolved_subs: List[str] = []
+    if dnsx_out.exists():
+        for line in dnsx_out.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split()
+            if parts:
+                resolved_subs.append(parts[0].strip())
+
+    resolved_subs = sorted(set(resolved_subs))
+    results["resolved"] = resolved_subs
+
+    # httpx
+    httpx_out = tmpdir / f"{domain}_httpx.txt"
+    cmd_httpx = [
+        "httpx",
+        "-silent",
+        "-status-code",
+        "-title",
+        "-follow-redirects",
+        "-threads",
+        str(threads),
+        "-l",
+        str(subs_file),
+        "-o",
+        str(httpx_out),
+    ]
+    run_cmd(cmd_httpx, verbose=verbose)
+
+    httpx_results: List[Dict[str, Any]] = []
+    if httpx_out.exists():
+        for line in httpx_out.read_text(encoding="utf-8", errors="ignore").splitlines():
+            entry = line.strip()
+            if not entry:
+                continue
+            httpx_results.append({"raw": entry})
+
+    results["httpx"] = httpx_results
+
+    if verbose:
+        print(f"[+] {domain}: {len(resolved_subs)} subdominios resueltos (dnsx)")
+        print(f"[+] {domain}: {len(httpx_results)} servicios HTTP detectados (httpx)")
+
+    return results
 
 
-def show_banner():
-    """Muestra el banner de inicio"""
-    os.system('clear' if os.name != 'nt' else 'cls')
-    print("\033[0;35m")
-    print("▗▄▄▄▖▗▞▀▜▌█  ▄ ▗▞▀▚▖ ▗▄▖ ▄   ▄ ▗▄▄▄▖█  ▄▄▄  ▄   ▄")
-    print("  █  ▝▚▄▟▌█▄▀  ▐▛▀▀▘▐▌ ▐▌█   █ ▐▌   █ █   █ █ ▄ █")
-    print("  █       █ ▀▄ ▝▚▄▄▖▐▌ ▐▌ ▀▄▀  ▐▛▀▀▘█ ▀▄▄▄▀ █▄█▄█")
-    print("  █       █  █      ▝▚▄▞▘      ▐▌   █")
-    print(f"                           \033[0;36mby TheOffSecGirl\033[0m")
-    print(f"\033[0;34mSubdomain Takeover Scanner Pro\033[0;36m\033[0m")
-    print("==================================================\n")
-    print("\033[0m")
+def run_subjack(domain: str, subs_file: Path, tmpdir: Path, verbose: bool) -> Path:
+    out_file = tmpdir / f"{domain}_subjack.txt"
+    if not subs_file.exists():
+        return out_file
+
+    fingerprints = tmpdir / "fingerprints.json"
+    if not fingerprints.exists():
+        url = "https://raw.githubusercontent.com/haccer/subjack/master/fingerprints.json"
+        cmd_curl = ["curl", "-sL", url, "-o", str(fingerprints)]
+        run_cmd(cmd_curl, verbose=verbose)
+
+    cmd = [
+        "subjack",
+        "-w",
+        str(subs_file),
+        "-t",
+        "100",
+        "-timeout",
+        "30",
+        "-ssl",
+        "-c",
+        str(fingerprints),
+        "-v",
+        "-o",
+        str(out_file),
+    ]
+    run_cmd(cmd, verbose=verbose)
+
+    return out_file
 
 
-def open_log():
-    """Abre archivo de log"""
-    global log_file
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"subdomain_scan_{timestamp}.log"
-    log_file = open(log_filename, "a", encoding="utf-8")
+def run_nuclei(
+    domain: str,
+    subs_file: Path,
+    tmpdir: Path,
+    threads: int,
+    templates: Optional[str],
+    verbose: bool,
+) -> Path:
+    out_file = tmpdir / f"{domain}_nuclei.txt"
+    if not subs_file.exists():
+        return out_file
+
+    # por defecto usamos tags de takeover
+    cmd = [
+        "nuclei",
+        "-silent",
+        "-l",
+        str(subs_file),
+        "-tags",
+        "takeover",
+        "-o",
+        str(out_file),
+        "-c",
+        str(threads),
+    ]
+
+    # si el usuario pasa templates, sustituimos
+    if templates:
+        cmd = [
+            "nuclei",
+            "-silent",
+            "-l",
+            str(subs_file),
+            "-t",
+            templates,
+            "-o",
+            str(out_file),
+            "-c",
+            str(threads),
+        ]
+
+    run_cmd(cmd, verbose=verbose)
+    return out_file
 
 
-def cleanup():
-    """Limpia archivos temporales"""
-    global tmp_dir
-    if tmp_dir and os.path.isdir(tmp_dir):
-        log("INFO", "Limpiando archivos temporales...")
-        try:
-            shutil.rmtree(tmp_dir)
-            log("INFO", "Limpieza completada.")
-        except Exception as e:
-            log("WARN", f"No se pudo limpiar tmpdir: {e}")
+def analyze_cname_patterns(
+    domain: str, subs_file: Path, tmpdir: Path, verbose: bool
+) -> Path:
+    """Usa dig para revisar CNAME y buscar patrones típicos de takeover."""
+    out_file = tmpdir / f"{domain}_cname_patterns.txt"
+    if not subs_file.exists():
+        return out_file
+
+    suspicious: List[str] = []
+
+    with subs_file.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            sub = line.strip()
+            if not sub:
+                continue
+            cmd = ["dig", sub, "CNAME", "+short"]
+            cname_out = run_cmd(cmd, verbose=False)
+            cname = cname_out.strip()
+            if not cname:
+                continue
+            for pattern in CNAME_TAKEOVER_PATTERNS:
+                if pattern in cname:
+                    suspicious.append(f"{sub} -> {cname}")
+                    break
+
+    if suspicious:
+        out_file.write_text("\n".join(suspicious), encoding="utf-8")
+
+    if verbose:
+        print(f"[+] {domain}: {len(suspicious)} CNAME sospechosos detectados")
+
+    return out_file
 
 
-def check_tools(tools):
-    """Verifica que las herramientas necesarias estén instaladas"""
-    log("INFO", "Verificando herramientas requeridas...")
-    missing = []
-    for tool in tools:
-        if not shutil.which(tool):
-            log("ERROR", f"{tool} no está instalado")
-            missing.append(tool)
-    if missing:
-        log("WARN", "Instala las herramientas faltantes. Ejemplo para subfinder:")
-        log("WARN", "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
-        return False
-    return True
+def parse_subjack_results(path: Path) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    if not path.exists():
+        return findings
+
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line.strip():
+            continue
+        entry = line.strip()
+        findings.append({"source": "subjack", "raw": entry})
+    return findings
 
 
-def run_command(cmd, capture_output=True, silent=False):
-    """Ejecuta comando del sistema"""
-    try:
-        if capture_output:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
-            if result.returncode != 0 and not silent:
-                return None
-            return result.stdout.strip()
-        else:
-            subprocess.run(cmd, timeout=TIMEOUT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return None
-    except subprocess.TimeoutExpired:
-        if not silent:
-            log("WARN", f"Timeout ejecutando {cmd[0]}")
-        return None
-    except Exception as e:
-        if not silent:
-            log("WARN", f"Error ejecutando {cmd[0]}: {e}")
-        return None
+def parse_nuclei_results(path: Path) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    if not path.exists():
+        return findings
+
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line.strip():
+            continue
+        entry = line.strip()
+        findings.append({"source": "nuclei", "raw": entry})
+    return findings
 
 
-def enumerate_subdomains(domain):
-    """Enumera subdominios usando subfinder y assetfinder"""
-    base = domain.replace(".", "_")
-    sf = os.path.join(tmp_dir, base + "_subfinder.txt")
-    af = os.path.join(tmp_dir, base + "_assetfinder.txt")
-    allf = os.path.join(tmp_dir, base + "_all.txt")
-
-    log("INFO", f"Procesando {domain} con Subfinder...")
-    cmd_sf = ["subfinder", "-d", domain, "-o", sf, "-silent", "-rl", str(RATE_LIMIT), 
-              "-t", str(THREADS), "-timeout", str(TIMEOUT)]
-    run_command(cmd_sf, capture_output=False, silent=True)
-
-    log("INFO", f"Procesando {domain} con Assetfinder...")
-    out = run_command(["assetfinder", "-subs-only", domain], silent=True)
-    if out:
-        lines = sorted(set(line.strip() for line in out.splitlines() if line.strip()))
-        with open(af, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-    else:
-        open(af, "w").close()
-
-    combined = combine_files([sf, af], allf)
-    log("INFO", f"Encontrados {combined} subdominios para {domain}")
+def parse_cname_results(path: Path) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    if not path.exists():
+        return findings
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if "->" not in line:
+            continue
+        sub, cname = [p.strip() for p in line.split("->", 1)]
+        findings.append(
+            {
+                "source": "cname-pattern",
+                "subdomain": sub,
+                "cname": cname,
+            }
+        )
+    return findings
 
 
-def combine_files(input_files, out_file):
-    """Combina archivos eliminando duplicados"""
-    result_set = set()
-    for f in input_files:
-        if os.path.isfile(f):
-            try:
-                with open(f, "r", encoding="utf-8") as file:
-                    for line in file:
-                        line = line.strip()
-                        if line:
-                            result_set.add(line)
-            except Exception as e:
-                log("WARN", f"Error leyendo {f}: {e}")
-    result_list = sorted(result_set)
-    with open(out_file, "w", encoding="utf-8") as f_out:
-        f_out.write("\n".join(result_list) + "\n")
-    return len(result_list)
+def build_markdown_report(
+    report_path: Path, summary: Dict[str, Any], verbose: bool
+):
+    lines: List[str] = []
+    lines.append(f"# Subdomain Takeover Report")
+    lines.append("")
+    lines.append(f"Generado: {datetime.utcnow().isoformat()} UTC")
+    lines.append("")
+    lines.append("## Resumen general")
+    lines.append("")
+    lines.append(f"- Dominios analizados: **{len(summary['domains'])}**")
+    total_subs = sum(len(d.get("subdomains", [])) for d in summary["domains"].values())
+    lines.append(f"- Subdominios totales descubiertos: **{total_subs}**")
+    total_takeovers = sum(
+        len(d.get("potential_takeovers", []))
+        for d in summary["domains"].values()
+    )
+    lines.append(f"- Posibles takeovers detectados: **{total_takeovers}**")
+    lines.append("")
 
+    for domain, data in summary["domains"].items():
+        lines.append(f"---")
+        lines.append(f"## Dominio: `{domain}`")
+        lines.append("")
+        lines.append(
+            f"- Subdominios descubiertos: **{len(data.get('subdomains', []))}**"
+        )
+        lines.append(
+            f"- Subdominios resueltos (dnsx): **{len(data.get('resolved', []))}**"
+        )
+        lines.append(
+            f"- Posibles takeovers: **{len(data.get('potential_takeovers', []))}**"
+        )
+        lines.append("")
 
-def combine_all_subdomains(out_file):
-    """Combina todos los archivos de subdominios"""
-    try:
-        files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.endswith("_all.txt")]
-    except:
-        files = []
-    
-    all_subs = []
-    for f in files:
-        try:
-            with open(f, "r", encoding="utf-8") as file:
-                all_subs.extend(file.read().splitlines())
-        except Exception as e:
-            log("WARN", f"Error leyendo {f}: {e}")
-    
-    uniq_subs = sorted(set(s.strip() for s in all_subs if s.strip()))
-    with open(out_file, "w", encoding="utf-8") as f_out:
-        f_out.write("\n".join(uniq_subs))
-
-
-def worker_domain(q):
-    """Worker thread para procesar dominios"""
-    while True:
-        domain = q.get()
-        if domain is None:
-            break
-        try:
-            enumerate_subdomains(domain)
-        except Exception as e:
-            log("WARN", f"Error en enumerar {domain}: {e}")
-        q.task_done()
-
-
-def line_count(filepath):
-    """Cuenta líneas no vacías en un archivo"""
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            return sum(1 for line in f if line.strip())
-    except:
-        return 0
-
-
-def scan_takeovers(subdomains_file):
-    """Escanea posibles subdomain takeovers"""
-    log("INFO", "Iniciando detección de subdomain takeovers...")
-
-    if not os.path.isfile(subdomains_file) or os.path.getsize(subdomains_file) == 0:
-        log("WARN", "No hay subdominios para analizar")
-        return
-
-    # Subjack scan
-    subjack_out = os.path.join(tmp_dir, "potential_takeovers_subjack.txt")
-    cmd_subjack = ["subjack", "-w", subdomains_file, "-t", str(THREADS), 
-                   "-timeout", str(TIMEOUT), "-o", subjack_out, "-ssl", "-v"]
-    log("INFO", "Ejecutando Subjack...")
-    run_command(cmd_subjack, capture_output=False, silent=True)
-
-    # Nuclei scan
-    nuclei_out = os.path.join(tmp_dir, "potential_takeovers_nuclei.txt")
-    cmd_nuclei = ["nuclei", "-l", subdomains_file, "-tags", "takeover",
-                  "-severity", "low,medium,high,critical", "-rate-limit", str(RATE_LIMIT),
-                  "-o", nuclei_out, "-silent"]
-    log("INFO", "Ejecutando Nuclei...")
-    run_command(cmd_nuclei, capture_output=False, silent=True)
-
-    # DNSX scan
-    dnsx_out = os.path.join(tmp_dir, "dns_analysis.txt")
-    cmd_dnsx = ["dnsx", "-l", subdomains_file, "-cname", "-resp", "-o", dnsx_out, "-silent"]
-    log("INFO", "Ejecutando DNSX...")
-    run_command(cmd_dnsx, capture_output=False, silent=True)
-
-    # Combinar resultados
-    combined_takeovers = os.path.join(tmp_dir, "potential_takeovers_combined.txt")
-    result_set = set()
-    
-    for out_file in [subjack_out, nuclei_out]:
-        if os.path.isfile(out_file):
-            try:
-                with open(out_file, "r", encoding="utf-8") as f:
-                    result_set.update(line.strip() for line in f if line.strip())
-            except:
-                pass
-    
-    with open(combined_takeovers, "w", encoding="utf-8") as f:
-        f.write("\n".join(sorted(result_set)))
-
-
-def verify_takeovers():
-    """Verifica y analiza posibles takeovers"""
-    log("INFO", "Verificando posibles takeovers...")
-    combined_file = os.path.join(tmp_dir, "potential_takeovers_combined.txt")
-
-    if not os.path.isfile(combined_file) or os.path.getsize(combined_file) == 0:
-        log("INFO", "No se encontraron posibles takeovers")
-        return
-
-    takeover_analysis = os.path.join(tmp_dir, "takeover_analysis.txt")
-    service_detection = os.path.join(tmp_dir, "service_detection.txt")
-
-    with open(takeover_analysis, "w", encoding="utf-8") as t_file, \
-         open(service_detection, "w", encoding="utf-8") as s_file:
-        
-        with open(combined_file, "r", encoding="utf-8") as f:
-            for line in f:
-                sub = line.strip()
-                if not sub:
-                    continue
-                
-                # Obtener CNAME
-                cname = run_command(["dig", "+short", "CNAME", sub], silent=True)
-                cname = cname.split("\n")[0].strip() if cname else ""
-                
-                # Obtener IP
-                ip = run_command(["dig", "+short", "A", sub], silent=True)
-                ip = ip.split("\n")[0].strip() if ip else ""
-
-                if cname:
-                    t_file.write(f"[CNAME] {sub} -> {cname}\n")
-                    if "amazonaws.com" in cname:
-                        s_file.write(f"[AWS] Posible S3 bucket: {sub} -> {cname}\n")
-                    elif "github.io" in cname:
-                        s_file.write(f"[GitHub] Posible GitHub Pages: {sub} -> {cname}\n")
-                    elif "azure" in cname:
-                        s_file.write(f"[Azure] Posible Azure resource: {sub} -> {cname}\n")
-                elif ip:
-                    t_file.write(f"[A] {sub} -> {ip}\n")
+        if data.get("potential_takeovers"):
+            lines.append("### Posibles takeovers")
+            lines.append("")
+            for finding in data["potential_takeovers"]:
+                src = finding.get("source", "unknown")
+                raw = finding.get("raw") or ""
+                sub = finding.get("subdomain") or ""
+                cname = finding.get("cname") or ""
+                if raw:
+                    lines.append(f"- **[{src}]** {raw}")
                 else:
-                    t_file.write(f"[NXDOMAIN] {sub} no resuelve\n")
+                    lines.append(
+                        f"- **[{src}]** `{sub}` -> `{cname}`"
+                    )
+            lines.append("")
 
-    # Análisis HTTP con httpx
-    log("INFO", "Analizando respuestas HTTP...")
-    httpx_out = os.path.join(tmp_dir, "takeover_http_analysis.json")
-    cmd_httpx = ["httpx", "-l", combined_file, "-status-code", "-content-length",
-                 "-title", "-tech-detect", "-favicon", "-json", "-o", httpx_out, "-silent"]
-    run_command(cmd_httpx, capture_output=False, silent=True)
+        if data.get("httpx"):
+            lines.append("### Servicios HTTP detectados (httpx)")
+            lines.append("")
+            for entry in data["httpx"][:50]:
+                lines.append(f"- `{entry.get('raw','')}`")
+            if len(data["httpx"]) > 50:
+                lines.append(f"- ... ({len(data['httpx']) - 50} más)")
+            lines.append("")
 
-    # Procesar con jq
-    jq_out = os.path.join(tmp_dir, "takeover_http_analysis.txt")
-    if os.path.isfile(httpx_out):
-        cmd_jq = ["jq", "-r", '.[] | "\\(.url) [\\(.status_code)] [\\(.tech)] \\(.title)"', httpx_out]
-        result = run_command(cmd_jq, silent=True)
-        if result:
-            with open(jq_out, "w", encoding="utf-8") as f:
-                f.write(result)
+        if data.get("subdomains"):
+            lines.append("### Subdominios descubiertos (primeros 50)")
+            lines.append("")
+            for s in data["subdomains"][:50]:
+                lines.append(f"- `{s}`")
+            if len(data["subdomains"]) > 50:
+                lines.append(f"- ... ({len(data['subdomains']) - 50} más)")
+            lines.append("")
 
-
-def read_file_content(path):
-    """Lee contenido de archivo"""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except:
-        return "(error leyendo archivo)"
-
-
-def generate_report(all_subs_file):
-    """Genera reporte final en formato Markdown"""
-    log("INFO", "Generando informe final...")
-
-    report_filename = f"subdomain_takeover_report_{datetime.datetime.now().strftime('%Y%m%d')}.md"
-    subs_count = line_count(all_subs_file)
-    
-    takeover_file = os.path.join(tmp_dir, "potential_takeovers_combined.txt")
-    takeovers_count = line_count(takeover_file) if os.path.isfile(takeover_file) else 0
-
-    with open(report_filename, "w", encoding="utf-8") as report:
-        report.write("# Subdomain Takeover Scan Report\n\n")
-        report.write(f"## Fecha: {datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S')}\n")
-        report.write("## Realizado por: TheOffSecGirl\n")
-        report.write(f"## Dominios analizados: {len(eligible_domains)}\n")
-        report.write(f"## Total de subdominios encontrados: {subs_count}\n")
-        report.write(f"## Posibles takeovers identificados: {takeovers_count}\n\n")
-
-        report.write("## Dominios Analizados:\n```\n")
-        for d in eligible_domains:
-            report.write(f"{d}\n")
-        report.write("```\n\n")
-
-        if takeovers_count > 0:
-            report.write("## Posibles Takeovers Identificados\n\n")
-            
-            report.write("### Detalles:\n```\n")
-            report.write(read_file_content(os.path.join(tmp_dir, "potential_takeovers_combined.txt")))
-            report.write("\n```\n\n")
-
-            report.write("### Análisis de DNS:\n```\n")
-            report.write(read_file_content(os.path.join(tmp_dir, "takeover_analysis.txt")))
-            report.write("\n```\n\n")
-
-            report.write("### Detección de Servicios:\n```\n")
-            report.write(read_file_content(os.path.join(tmp_dir, "service_detection.txt")))
-            report.write("\n```\n\n")
-
-            report.write("### Resultados HTTP:\n```\n")
-            report.write(read_file_content(os.path.join(tmp_dir, "takeover_http_analysis.txt")))
-            report.write("\n```\n\n")
-
-            report.write("## Recomendaciones:\n")
-            report.write("1. Verificar manualmente cada posible takeover\n")
-            report.write("2. Reclamar dominios vulnerables en los servicios correspondientes\n")
-            report.write("3. Monitorear regularmente con este script\n\n")
-        else:
-            report.write("## No se encontraron posibles takeovers\n\n")
-
-        report.write("## Estadísticas\n")
-        report.write(f"- Subdominios únicos encontrados: {subs_count}\n")
-        report.write(f"- Posibles takeovers: {takeovers_count}\n\n")
-        report.write("---\n")
-        report.write("Reporte generado automáticamente por Subdomain Takeover Scanner Pro\n")
-
-    log("INFO", f"Reporte guardado en: {report_filename}")
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    if verbose:
+        print(f"[+] Informe Markdown generado en: {report_path}")
 
 
 def main():
-    """Función principal"""
-    global tmp_dir
-    
-    # Manejador de CTRL+C
-    def signal_handler(sig, frame):
-        log("INFO", "Interrupción del usuario detectada")
-        cleanup()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
+    print_banner()
+    args = parse_args()
 
-    show_banner()
-    parse_args()
-    open_log()
-    tmp_dir = tempfile.mkdtemp(prefix="takeovflow_tmp_")
+    ensure_tools(verbose=args.verbose)
+    domains = normalize_domains(args)
+    if args.verbose:
+        print(f"[+] Dominios a analizar: {', '.join(domains)}\n")
 
-    required_tools = ["subfinder", "assetfinder", "subjack", "httpx", "dnsx", "nuclei", "dig", "jq", "curl"]
-    if not check_tools(required_tools):
-        log("ERROR", "Faltan herramientas requeridas")
-        cleanup()
-        sys.exit(1)
+    tmpdir_str = tempfile.mkdtemp(prefix="takeovflow_tmp_")
+    tmpdir = Path(tmpdir_str)
 
-    log("INFO", f"Dominios cargados: {len(eligible_domains)}")
+    summary: Dict[str, Any] = {"domains": {}}
 
-    # Procesar dominios con threads
-    q = queue.Queue()
-    for domain in eligible_domains:
-        q.put(domain)
+    for domain in domains:
+        if args.verbose:
+            print(f"[*] Analizando dominio: {domain}")
 
-    threads_list = []
-    for _ in range(min(THREADS, len(eligible_domains))):
-        t = threading.Thread(target=worker_domain, args=(q,), daemon=False)
-        t.start()
-        threads_list.append(t)
+        domain_data: Dict[str, Any] = {}
+        subs_file: Optional[Path] = None
 
-    q.join()
+        # Fase pasiva
+        if not args.active_only:
+            subs_file = discover_subdomains(
+                domain, tmpdir=tmpdir, threads=args.threads, verbose=args.verbose
+            )
+            subdomains_list: List[str] = []
+            if subs_file.exists():
+                subdomains_list = [
+                    s.strip()
+                    for s in subs_file.read_text(
+                        encoding="utf-8", errors="ignore"
+                    ).splitlines()
+                    if s.strip()
+                ]
+            domain_data["subdomains"] = subdomains_list
+        else:
+            if args.verbose:
+                print(
+                    "[!] Modo --active-only: no se realiza descubrimiento pasivo. "
+                    "Debes proporcionar tú los subdominios (no implementado aquí)."
+                )
 
-    for _ in threads_list:
-        q.put(None)
-    for t in threads_list:
-        t.join()
+        # Fase activa
+        if not args.passive_only and subs_file and subs_file.exists():
+            resolved_info = resolve_subdomains(
+                domain,
+                subs_file=subs_file,
+                tmpdir=tmpdir,
+                threads=args.threads,
+                verbose=args.verbose,
+            )
+            domain_data["resolved"] = resolved_info.get("resolved", [])
+            domain_data["httpx"] = resolved_info.get("httpx", [])
 
-    # Combinar subdominios
-    all_subdomains_file = os.path.join(tmp_dir, "all_subdomains_combined.txt")
-    combine_all_subdomains(all_subdomains_file)
+            # subjack
+            subjack_out = run_subjack(
+                domain, subs_file=subs_file, tmpdir=tmpdir, verbose=args.verbose
+            )
+            subjack_findings = parse_subjack_results(subjack_out)
 
-    unique_count = line_count(all_subdomains_file)
-    log("INFO", f"Subdominios únicos encontrados: {unique_count}")
+            # nuclei
+            nuclei_out = run_nuclei(
+                domain,
+                subs_file=subs_file,
+                tmpdir=tmpdir,
+                threads=args.threads,
+                templates=args.nuclei_templates,
+                verbose=args.verbose,
+            )
+            nuclei_findings = parse_nuclei_results(nuclei_out)
 
-    # Escanear takeovers
-    scan_takeovers(all_subdomains_file)
-    
-    # Verificar takeovers
-    verify_takeovers()
-    
-    # Generar reporte
-    generate_report(all_subdomains_file)
+            # CNAME patterns
+            cname_out = analyze_cname_patterns(
+                domain, subs_file=subs_file, tmpdir=tmpdir, verbose=args.verbose
+            )
+            cname_findings = parse_cname_results(cname_out)
 
-    log("INFO", "Escaneo completado.")
-    print("\n\033[0;32m=== Escaneo completado con éxito ===\033[0m")
-    print("Revise archivos de resultado e informe.\n")
+            domain_data["potential_takeovers"] = (
+                subjack_findings + nuclei_findings + cname_findings
+            )
+        else:
+            domain_data.setdefault("resolved", [])
+            domain_data.setdefault("httpx", [])
+            domain_data.setdefault("potential_takeovers", [])
 
-    cleanup()
-    if log_file:
-        log_file.close()
+        summary["domains"][domain] = domain_data
+        if args.verbose:
+            print()
+
+    # Generar informe
+    now = datetime.utcnow().strftime("%Y%m%d")
+    report_md = Path.cwd() / f"subdomain_takeover_report_{now}.md"
+    build_markdown_report(report_md, summary, verbose=args.verbose)
+
+    if args.json_output:
+        report_json = Path.cwd() / f"subdomain_takeover_report_{now}.json"
+        report_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        if args.verbose:
+            print(f"[+] Informe JSON generado en: {report_json}")
+
+    print("[✓] Análisis completado.")
+    print(f"    Informe Markdown: {report_md}")
+    if args.json_output:
+        print(f"    Informe JSON:     {report_json}")
 
 
 if __name__ == "__main__":
