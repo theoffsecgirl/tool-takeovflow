@@ -5,7 +5,7 @@ Versión mejorada por **TheOffSecGirl**
 
 ---
 
-## 1. Descripción
+## Descripción
 
 `takeovflow` es un escáner ofensivo diseñado para detectar posibles **subdomain takeovers** combinando descubrimiento pasivo, resolución activa, detección con subjack/nuclei y análisis de patrones de CNAME asociados a servicios susceptibles de takeover.
 
@@ -21,7 +21,7 @@ Incluye:
 
 ---
 
-## 2. Requisitos
+## Requisitos
 
 Herramientas externas necesarias:
 
@@ -40,7 +40,7 @@ El script comprueba automáticamente su disponibilidad.
 
 ---
 
-## 3. Instalación
+## Instalación
 
 ```bash
 git clone https://github.com/theoffsecgirl/tool-takeovflow.git
@@ -50,7 +50,7 @@ chmod +x takeovflow.py
 
 ---
 
-## 4. Uso rápido
+## Uso rápido
 
 ### Dominio único
 
@@ -72,7 +72,7 @@ python3 takeovflow.py -l "dom1.com,dom2.net"
 
 ---
 
-## 5. Modos nuevos
+## Modos nuevos
 
 ### Solo pasivo
 
@@ -100,7 +100,7 @@ python3 takeovflow.py -d example.com --nuclei-templates ./mis-templates/
 
 ---
 
-## 6. Flujo técnico
+## Flujo técnico
 
 ### Fase pasiva
 - subfinder  
@@ -129,7 +129,7 @@ python3 takeovflow.py -d example.com --nuclei-templates ./mis-templates/
 
 ---
 
-## 7. Ejemplo completo
+## Ejemplo completo
 
 ```bash
 python3 takeovflow.py -f scope.txt -t 100 -r 5 -v --json-output     --nuclei-templates ./takeover-templates/
@@ -137,7 +137,7 @@ python3 takeovflow.py -f scope.txt -t 100 -r 5 -v --json-output     --nuclei-tem
 
 ---
 
-## 8. Archivos generados
+## Archivos generados
 
 - `takeovflow_tmp_*`
 - `*_subfinder.txt`
@@ -153,7 +153,7 @@ python3 takeovflow.py -f scope.txt -t 100 -r 5 -v --json-output     --nuclei-tem
 
 ---
 
-## 9. Limitaciones
+## Limitaciones
 
 - Depende de herramientas externas.
 - Posibles falsos positivos/negativos.
@@ -161,13 +161,16 @@ python3 takeovflow.py -f scope.txt -t 100 -r 5 -v --json-output     --nuclei-tem
 
 ---
 
-## 10. Licencia
+## Licencia
 
 Uso ético y responsable únicamente. Sin garantías.
 
 ---
 
-## 11. Autora
+## Autora
 
-**TheOffSecGirl**  
-https://www.theoffsecgirl.com/
+Proyecto desarrollado por **TheOffSecGirl**.
+
+- GitHub: https://github.com/theoffsecgirl  
+- Web técnica: https://www.theoffsecgirl.com  
+- Academia: https://www.northstaracademy.io
