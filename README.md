@@ -1,122 +1,140 @@
 # takeovflow
 
-> Subdomain Takeover Scanner Pro  
-> Versión Python de la herramienta desarrollada por TheOffSecGirl
+Subdomain Takeover Scanner en Python  
+Versión avanzada de la herramienta desarrollada por TheOffSecGirl.
 
-***
+---
 
-## Descripción
+## 1. Descripción
 
-`takeovflow` es un escáner avanzado para detección de **subdomain takeovers**.  
-Utiliza herramientas externas reconocidas como `subfinder`, `assetfinder`, `subjack`, `httpx`, `dnsx` y `nuclei` para realizar un análisis exhaustivo de subdominios y servicios vulnerables.
+`takeovflow` es un escáner para detectar posibles **subdomain takeovers** en uno o varios dominios.
 
-***
+Orquesta varias herramientas externas:
 
-## Requisitos
+- Descubrimiento de subdominios: `subfinder`, `assetfinder`
+- Resolución y filtrado: `dnsx`, `httpx`, `dig`, `jq`, `curl`
+- Detección de posibles takeovers: `subjack`, `nuclei`
+- Generación de un **informe final en Markdown** con el resumen del análisis
 
-Necesitas tener instalado en tu sistema y accesible en el `PATH`:
+Está pensado para entornos de **bug bounty**, **hacking ético** y auditorías ofensivas.
 
-- [subfinder](https://github.com/projectdiscovery/subfinder)
-- [assetfinder](https://github.com/tomnomnom/assetfinder)
-- [subjack](https://github.com/haccer/subjack)
-- [httpx](https://github.com/projectdiscovery/httpx)
-- [dnsx](https://github.com/projectdiscovery/dnsx)
-- [nuclei](https://github.com/projectdiscovery/nuclei)
-- `dig`
-- `jq`
-- `curl`
-- **Python 3** (recomendado >= 3.7)
+---
 
-El script descargará automáticamente fingerprints para `subjack` si es necesario.
+## 2. Requisitos
 
-***
+Sistema recomendado:
 
-## Instalación
+- Linux (probado)  
+- macOS debería funcionar si todas las herramientas están correctamente instaladas y en el `PATH`.
 
-1. Clona este repositorio:
+Dependencias externas necesarias:
 
-   ```
-   git clone https://github.com/theoffsecgirl/takeovflow.git
-   cd takeovflow
-   ```
+- subfinder
+- assetfinder
+- subjack
+- httpx
+- dnsx
+- nuclei
+- dig
+- jq
+- curl
+- Python 3 (≥ 3.7)
 
-2. Asegúrate de tener Python 3 y las dependencias externas en tu sistema.
+---
 
-3. Dale permisos de ejecución si quieres:
+## 3. Instalación
 
-   ```
-   chmod +x takeovflow.py
-   ```
-
-***
-
-## Uso
-
-Ejecuta el script Python con las opciones que prefieras:
-
-```
-python3 takeovflow.py -d example.com -t 50 -r 2 -v
+```bash
+git clone https://github.com/theoffsecgirl/takeovflow.git
+cd takeovflow
+chmod +x takeovflow.py
 ```
 
-### Opciones
+---
 
-| Opción       | Descripción                                     |
-| ------------- | ------------------------------------------------|
-| -d, --domain  | Escanear un único dominio                       |
-| -f, --file    | Archivo con lista de dominios (uno por línea)   |
-| -l, --list    | Lista de dominios separados por comas           |
-| -t, --threads | Número de hilos a usar (por defecto 50)         |
-| -r, --rate    | Rate limit para las peticiones (por defecto 2)  |
-| -v, --verbose | Modo verbose (salida detallada)                 |
-| -h, --help    | Mostrar ayuda                                   |
+## 4. Uso rápido
 
-***
+```bash
+python3 takeovflow.py -d example.com -v
+```
 
-## Ejemplos de uso
+```bash
+python3 takeovflow.py -f dominios.txt
+```
 
-- Escanear dominio único:
-  ```
-  python3 takeovflow.py -d example.com -v
-  ```
+```bash
+python3 takeovflow.py -l "dominio1.com,dominio2.net"
+```
 
-- Escanear varios dominios desde archivo:
-  ```
-  python3 takeovflow.py -f dominios.txt
-  ```
+---
 
-- Escanear múltiples dominios separados por coma:
-  ```
-  python3 takeovflow.py -l "dominio1.com,dominio2.net"
-  ```
+## 5. Opciones disponibles
 
-***
+```text
+-d, --domain   Escanear un único dominio
+-f, --file     Archivo con lista de dominios (uno por línea)
+-l, --list     Lista de dominios separados por comas
+-t, --threads  Número de hilos (50 por defecto)
+-r, --rate     Rate limit (2 por defecto)
+-v, --verbose  Modo verbose
+-h, --help     Ayuda
+```
 
-## Salida
+---
 
-- Se genera un informe Markdown con resultados, subdominios encontrados y posibles takeovers identificados.
-- También se crean logs detallados con todo el proceso de ejecución.
+## 6. Flujo interno
 
-***
+1. Normaliza y valida dominios.  
+2. Descubre subdominios (subfinder, assetfinder).  
+3. Resuelve y filtra (dnsx, httpx, dig, jq).  
+4. Busca takeovers (subjack, nuclei).  
+5. Combina y deduplica resultados.  
+6. Genera informe final en Markdown.
 
-## Contribuciones
+---
 
-Se aceptan contribuciones mediante pull requests.  
-Por favor, abre issues para reportar bugs o sugerir mejoras.
+## 7. Archivos generados
 
-***
+- Directorio temporal `takeovflow_tmp_*`
+- Archivos intermedios (`*_subfinder.txt`, `*_assetfinder.txt`)
+- `potential_takeovers_*`
+- `dns_analysis.txt`
+- `takeover_analysis.txt`
+- Informe final: `subdomain_takeover_report_YYYYMMDD.md`
 
-## Licencia
+---
 
-Proyecto libre para uso ético.  
-No se ofrece garantía alguna.
+## 8. Buenas prácticas
 
-***
+- Respeta siempre el marco legal.  
+- No escanees sin permiso.  
+- Ajusta threads y rate limits.  
+- Usa repos privados para informes sensibles.
 
-## Contacto
+---
 
-Desarrollado por TheOffSecGirl  
-[https://github.com/TheOffSecGirl](https://github.com/TheOffSecGirl)
+## 9. Limitaciones
 
-***
+- Depende de herramientas externas.  
+- La detección no es infalible.  
+- Resultados ligados a versiones de herramientas.
 
-¿Te ayudo con otro archivo o texto?
+---
+
+## 10. Contribuciones
+
+Pull requests bienvenidos.  
+Reporta issues para mejoras y bugs.
+
+---
+
+## 11. Licencia
+
+Uso ético únicamente. Sin garantías.
+
+---
+
+## 12. Autor
+
+TheOffSecGirl  
+GitHub: https://github.com/theoffsecgirl
